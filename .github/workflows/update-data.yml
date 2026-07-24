@@ -42,5 +42,11 @@ jobs:
           fi
 
       - name: Disparar deploy na Vercel
-        if: ${{ secrets.VERCEL_DEPLOY_HOOK_URL != '' }}
-        run: curl --fail -X POST "${{ secrets.VERCEL_DEPLOY_HOOK_URL }}"
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$DEPLOY_HOOK_URL" ]; then
+            curl --fail -X POST "$DEPLOY_HOOK_URL"
+          else
+            echo "VERCEL_DEPLOY_HOOK_URL não configurado; pulando deploy."
+          fi
