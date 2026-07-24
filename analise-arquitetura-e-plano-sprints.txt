@@ -1,0 +1,313 @@
+PROCESSHOOPS ANALYTICS
+Análise crítica da arquitetura + Plano de implementação em Sprints
+Preparado por: Claude (Engenheiro de Software Sênior, parceiro de desenvolvimento)
+Data: 2026-07-24
+Status: NENHUM CÓDIGO FOI CRIADO. Documento aguardando aprovação.
+
+===============================================================================
+1. RESUMO EXECUTIVO
+===============================================================================
+
+A visão do projeto é sólida e a arquitetura proposta (Pipeline Python -> JSON ->
+GitHub -> Vercel -> Front-end estático) é uma escolha correta para os objetivos
+declarados: custo zero, simplicidade, performance e "o Python pensa, o front-end
+apresenta".
+
+Porém, existem riscos técnicos concretos que, se não forem endereçados ANTES da
+Sprint 1, podem comprometer a viabilidade do projeto inteiro — não são detalhes
+de polimento, são riscos de fundação. O mais crítico é a confiabilidade do
+nba_api quando executado a partir de runners do GitHub Actions (ver item 3.1).
+Por isso, proponho uma "Sprint 0" de validação técnica antes de qualquer Sprint
+funcional do roadmap original.
+
+Este documento está dividido em:
+  2. Pontos fortes da arquitetura documentada
+  3. Riscos técnicos identificados (por severidade)
+  4. Melhorias propostas (arquitetura, UX, organização)
+  5. Decisões em aberto que precisam da sua aprovação
+  6. Plano de implementação em Sprints
+  7. Fora de escopo / adiado deliberadamente
+
+===============================================================================
+2. PONTOS FORTES DA ARQUITETURA DOCUMENTADA
+===============================================================================
+
+- Separação limpa entre pipeline (inteligência) e front-end (apresentação).
+  Isso é exatamente o padrão certo para manter o navegador leve e o código do
+  front-end simples, sem lógica de negócio espalhada em componentes React.
+
+- Stack 100% gratuita e madura (Next.js, Tailwind, shadcn/ui, ECharts,
+  TanStack Table, GitHub Actions, Vercel). Não há dependência de serviços pagos
+  ou proprietários.
+
+- JSONs organizados por domínio (players, teams, standings, etc.) facilita
+  cache por arquivo e carregamento incremental por página, em vez de um único
+  JSON monolítico.
+
+- Requisitos já preveem estados de loading/vazio/erro em todas as páginas —
+  isso normalmente é esquecido e é ótimo que já esteja no documento de
+  requisitos desde o início.
+
+- A exigência de documentar limitações da nba_api antes de implementar
+  qualquer funcionalidade é uma prática de engenharia madura e evita
+  retrabalho.
+
+===============================================================================
+3. RISCOS TÉCNICOS IDENTIFICADOS (por severidade)
+===============================================================================
+
+-------------------------------------------------------------------------
+3.1 [CRÍTICO] Confiabilidade da nba_api a partir de runners do GitHub Actions
+-------------------------------------------------------------------------
+A nba_api é um wrapper não-oficial sobre o stats.nba.com. Esse endpoint usa
+proteção anti-bot (Akamai) que costuma bloquear ou retornar 403/timeout para
+faixas de IP de datacenter — incluindo, com frequência, os IPs dos runners
+hospedados do GitHub Actions. Isso é um problema documentado e recorrente na
+comunidade de usuários da lib, não uma hipótese teórica.
+
+Impacto: se o pipeline não conseguir rodar de forma confiável no GitHub
+Actions, TODA a arquitetura ("atualização automática diária" via Actions)
+fica comprometida, independente de quão bem o front-end seja construído.
+
+Mitigações possíveis (a decidir com você, ver seção 5):
+  a) Validar cedo (Sprint 0) se o runner consegue de fato acessar a nba_api de
+     forma estável, com headers corretos (User-Agent, Referer) e throttling.
+  b) Se falhar, usar um runner self-hosted (ex.: uma máquina/Raspberry Pi
+     pessoal, ou mesmo rodar localmente com push manual) — gratuito, mas exige
+     infraestrutura própria sempre ligada.
+  c) Usar um serviço de proxy residencial gratuito/baixo custo como saída de
+     rede (foge de "ferramentas 100% gratuitas" se pago).
+  d) Reduzir a frequência/volume de chamadas e implementar retry com backoff
+     exponencial + cache do último dado válido (o próprio documento de
+     arquitetura já prevê preservar dados válidos em caso de falha parcial —
+     bom, mas precisa ser robusto a falhas TOTAIS de um dia inteiro, não só
+     parciais).
+
+-------------------------------------------------------------------------
+3.2 [ALTO] Crescimento indefinido do histórico Git com commits diários de dados
+-------------------------------------------------------------------------
+Se os JSONs de `data/` forem versionados no mesmo repositório Git que o
+código-fonte, e o pipeline commitar novos arquivos todo dia, o histórico do
+repositório cresce para sempre. Em poucos anos isso infla o tamanho do clone,
+deixa checkouts do Vercel/Actions mais lentos e pode aproximar dos limites
+recomendados do GitHub (repositórios >1GB começam a gerar avisos).
+
+Mitigação proposta: os dados devem ser tratados como estado mutável, não como
+histórico versionado linha a linha. Ex.: squash periódico do histórico de
+dados, ou (melhor) manter `data/` fora do Git tradicional — usar Git apenas
+para o snapshot mais recente com `git commit --amend` + force-push controlado
+em um branch de dados dedicado, ou migrar para Vercel Blob Storage / GitHub
+Releases como destino dos JSONs, mantendo o repo de código enxuto.
+
+-------------------------------------------------------------------------
+3.3 [ALTO] Volume de dados do Scatter Explorer, Shot Charts e Game Logs
+-------------------------------------------------------------------------
+O Scatter Explorer precisa combinar qualquer estatística x qualquer entidade x
+filtros de temporada/split. Se os JSONs consumidos pelo front-end não forem
+bem particionados, o navegador pode acabar baixando dezenas de MBs para
+montar um único gráfico — o que viola diretamente a diretriz de performance do
+CLAUDE.md.
+
+Mapas de arremesso (shot charts) e game logs por jogador/temporada são os
+domínios de maior volume (centenas de jogadores x múltiplas temporadas x
+múltiplos jogos). Gerar um arquivo por jogador/temporada (em vez de arquivos
+únicos gigantes) é necessário, mas precisa ser desenhado com cuidado para não
+gerar milhares de arquivos pequenos que também pesam no armazenamento/list.
+
+Mitigação: desenhar o particionamento de arquivos ANTES de gerar dados reais
+(ver Sprint 0/1), com lazy loading por página — a página de um jogador só
+carrega o shot chart daquele jogador/temporada, nunca a base inteira.
+
+-------------------------------------------------------------------------
+3.4 [MÉDIO] Tempo de execução do pipeline e rate limiting da nba_api
+-------------------------------------------------------------------------
+A nba_api recomenda intervalos entre requisições (evitar bans de IP). Com
+~450+ jogadores ativos, múltiplos endpoints por jogador/time e múltiplas
+temporadas para "Evolução" e "Compare", uma atualização diária completa pode
+facilmente ultrapassar o tempo de execução prático de um job (ou o limite de
+6h do GitHub Actions em repositórios gratuitos, embora distante ainda).
+
+Mitigação: separar claramente "atualização incremental diária" (temporada
+atual: standings, próximos jogos, stats atualizadas) de "backfill histórico"
+(rodado uma vez, sob demanda, não diariamente).
+
+-------------------------------------------------------------------------
+3.5 [MÉDIO] Confiabilidade do agendamento (`schedule` do GitHub Actions)
+-------------------------------------------------------------------------
+Cron jobs do GitHub Actions não têm garantia de horário exato (podem atrasar
+em períodos de alta demanda) e são desabilitados automaticamente após 60 dias
+sem atividade no repositório. Como commits diários de dados vão manter o repo
+ativo, o segundo problema tende a não ocorrer — mas vale monitorar.
+
+Mitigação: expor no front-end um indicador discreto de "dados atualizados há
+X horas" (metadado simples já gerado pelo pipeline) e configurar notificação
+de falha do workflow (e-mail do GitHub já faz isso por padrão, gratuito).
+
+-------------------------------------------------------------------------
+3.6 [MÉDIO] Estabilidade de schema da nba_api
+-------------------------------------------------------------------------
+Endpoints não-oficiais mudam de forma sem aviso (colunas renomeadas, campos
+removidos). Sem validação de schema no pipeline, um JSON malformado pode ser
+publicado e quebrar o front-end silenciosamente, mesmo com os estados de erro
+da UI (o erro só apareceria se o dado estivesse ausente, não se estivesse
+malformado).
+
+Mitigação: validar a saída do pipeline com um schema (ex.: Pydantic) antes de
+escrever o JSON final; se a validação falhar, manter o último JSON válido —
+consistente com o princípio já definido no doc de arquitetura.
+
+-------------------------------------------------------------------------
+3.7 [BAIXO/MÉDIO] Contraste e acessibilidade nos temas por time
+-------------------------------------------------------------------------
+O requisito "a página deve adaptar-se ao tema oficial da franquia, preservando
+legibilidade e acessibilidade" é fácil de violar na prática: várias cores
+oficiais de times NBA têm baixo contraste em fundo claro ou escuro (ex.:
+amarelo do Lakers/Nuggets sobre branco). Isso deveria ser resolvido com uma
+paleta derivada e validada (contraste WCAG AA) gerada uma única vez por time,
+não deixado para CSS ad-hoc por página.
+
+-------------------------------------------------------------------------
+3.8 [BAIXO] Imagens de jogadores e logos de times
+-------------------------------------------------------------------------
+Não está definido se as imagens virão via hotlink direto de CDNs da NBA (risco
+de bloqueio de hotlink ou URLs instáveis) ou serão baixadas/cacheadas pelo
+pipeline. Precisa de uma decisão explícita (ver seção 5) porque afeta
+diretamente o "Scatter Explorer" (pontos = fotos/logos) e o armazenamento no
+repositório.
+
+===============================================================================
+4. MELHORIAS PROPOSTAS
+===============================================================================
+
+4.1 Arquitetura
+- Adicionar um "manifest" leve (ex.: `data/meta.json`) com timestamp da última
+  atualização, status de cada domínio (ok/erro/parcial) e versão de schema.
+  Baixo custo, alto valor para observabilidade e para o indicador de
+  frescor de dados na UI.
+- Usar um Vercel Deploy Hook disparado ao final do pipeline (após commit dos
+  JSONs) em vez de depender apenas do "push dispara deploy" automático do
+  Vercel. Dá controle explícito sobre quando o build acontece (ex.: só depois
+  que TODOS os domínios do dia terminaram, evitando builds parciais/inconsistentes).
+- Particionar dados por temporada desde o primeiro dia (`players/{season}/...`),
+  mesmo suportando só a NBA atual — alinhado ao próprio requisito de
+  escalabilidade para múltiplas ligas/temporadas futuras, e evita retrabalho
+  estrutural depois.
+
+4.2 UX
+- Indicador sutil de "dados atualizados há X" no rodapé/nav, aumenta confiança
+  do usuário sem poluir a tela.
+- Estado explícito de "fora de temporada" (offseason) nos KPIs/standings/jogos,
+  em vez de simplesmente mostrar listas vazias — melhora a percepção de
+  qualidade do produto quando não há jogos.
+
+4.3 Performance
+- Lazy-load das bibliotecas de exportação (xlsx/csv) só quando o usuário
+  aciona export, evitando aumentar o bundle inicial de todas as páginas.
+- Índice de busca global (jogadores + times) como um único JSON pequeno e
+  compacto, carregado uma vez e cacheado no cliente (via algo leve como
+  Fuse.js), evitando qualquer round-trip de rede a cada tecla digitada.
+
+4.4 Organização de código
+- Confirmar a estrutura `src/{components,pages,hooks,services,types,utils}` do
+  doc de arquitetura, mas adaptada às convenções do Next.js App Router (ex.:
+  `app/` para rotas, mantendo `components/hooks/services/types/utils` como
+  módulos compartilhados). Vou detalhar isso na Sprint 0 antes de criar
+  qualquer arquivo.
+
+===============================================================================
+5. DECISÕES EM ABERTO (preciso da sua orientação antes de começar)
+===============================================================================
+
+D1. Runner do pipeline: confiamos no GitHub Actions hospedado como está, ou
+    você já sabe/suspeita que teremos bloqueio de IP e prefere já partir para
+    um runner self-hosted?
+
+D2. Armazenamento dos JSONs: manter tudo no mesmo repositório Git (mais simples,
+    mas cresce para sempre) ou usar uma estratégia que evite histórico
+    infinito (branch de dados com force-push, ou Vercel Blob)?
+
+D3. Imagens (fotos de jogadores/logos de times): hotlink direto das CDNs
+    oficiais da NBA, ou baixar e versionar localmente via pipeline?
+
+D4. Profundidade histórica inicial: quantas temporadas para trás entram no
+    MVP (Compare/Evolução)? Só a temporada atual, ou N temporadas anteriores?
+    Isso muda diretamente o escopo e o tempo de execução do backfill.
+
+D5. Alertas de falha do pipeline: e-mail padrão do GitHub Actions é suficiente,
+    ou você quer um webhook (ex.: Discord/Slack, ambos gratuitos)?
+
+===============================================================================
+6. PLANO DE IMPLEMENTAÇÃO EM SPRINTS
+===============================================================================
+
+SPRINT 0 — Validação técnica e fundação (NOVA, não estava no roadmap original)
+Objetivo: reduzir o risco crítico (3.1) antes de investir em qualquer feature.
+Entregas:
+  - Scaffolding do pipeline (Python) e do front-end (Next.js + TS + Tailwind +
+    shadcn/ui), seguindo a estrutura de pastas da arquitetura.
+  - Spike: script mínimo que busca 1 endpoint simples (standings) da nba_api
+    rodando dentro de um workflow do GitHub Actions, não só localmente.
+    Resultado determina a decisão D1.
+  - Workflow do GitHub Actions com schedule diário (05:00 BRT) + trigger manual,
+    e Vercel Deploy Hook conectado.
+  - Definição final da estrutura de pastas em `data/` (particionamento por
+    temporada/domínio) e do manifest de status/frescor.
+  - Decisões D1–D5 confirmadas com você.
+Critério de sucesso: front-end no ar na Vercel exibindo dados reais de
+standings vindos do pipeline automatizado, ponta a ponta.
+
+SPRINT 1 — Home (MVP)
+  - Pipeline: standings, próximos jogos, KPIs da temporada.
+  - Front-end: navbar, busca global, tabela de standings, cards de próximos
+    jogos, cards de KPI com tooltip, tema claro/escuro.
+
+SPRINT 2 — Teams (MVP)
+  - Pipeline: stats tradicionais/avançadas de times, rankings vs liga, splits
+    situacionais, elenco.
+  - Front-end: seleção de time, tema visual por franquia (com paleta
+    acessível derivada, ver 3.7), header, KPIs com ranking, desempenho
+    situacional, tabela de elenco.
+
+SPRINT 3 — Players (MVP)
+  - Pipeline: stats tradicionais/avançadas por jogador, percentis por posição,
+    game log.
+  - Front-end: seleção de jogador, header, abas de estatísticas, percentis
+    visuais, troca rápida de temporada/jogador.
+
+SPRINT 4 — Scatter Explorer (MVP)
+  - Pipeline: datasets achatados por entidade/estatística/filtro, já
+    particionados para carregamento leve (ver 3.3).
+  - Front-end: seletores de eixo, alternância jogadores/times, filtros,
+    scatter com fotos/logos, tooltip, clique navega preservando estado,
+    seleção de região sincronizada com tabela vinculada.
+
+SPRINT 5 — Compare
+  - Front-end: comparação lado a lado (jogador x jogador, time x time),
+    grupos de estatísticas com destaque do melhor valor, mini-gráficos,
+    seleção de temporada igual ou diferente.
+
+SPRINT 6 — Shot Charts, Exportação, Configurações e Polimento
+  - Pipeline: dados de mapa de arremesso por jogador/temporada.
+  - Front-end: mapa de arremesso, exportação (PNG/SVG/CSV/XLSX) lazy-loaded,
+    configurações persistidas localmente, revisão de responsividade mobile em
+    todas as páginas.
+
+SPRINT 7 — Observabilidade e Resiliência (recomendada, não estava no roadmap)
+  - Validação de schema no pipeline, alertas de falha, indicador de frescor
+    de dados na UI, job de backfill histórico isolado do job diário, revisão
+    da estratégia de crescimento do repositório (3.2).
+
+===============================================================================
+7. FORA DE ESCOPO / ADIADO DELIBERADAMENTE
+===============================================================================
+
+- Novas ligas além da NBA, dashboards personalizados e comparações históricas
+  avançadas: mencionados no roadmap como "versões futuras" — não entram em
+  nenhuma Sprint acima, mas a estrutura de dados particionada por
+  liga/temporada (proposta em 4.1) já deixa o caminho aberto sem retrabalho.
+- Qualquer autenticação, conta de usuário ou persistência em servidor: fora do
+  escopo, projeto é 100% estático + preferências locais (localStorage).
+
+===============================================================================
+FIM DO DOCUMENTO — aguardando sua aprovação para iniciar a Sprint 0.
+===============================================================================
